@@ -5,6 +5,7 @@ import torch
 from torch.autograd import Variable
 from torch.utils.data import DataLoader
 import torchvision
+import torch.nn.functional as functional
 
 from dataset import SBDClassSeg, MyTestData
 from transform import Colorize
@@ -17,6 +18,7 @@ import visdom
 import numpy as np
 import argparse
 import os
+import gc
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--phase', type=str, default='train', help='train or test')
@@ -28,7 +30,7 @@ opt = parser.parse_args()
 opt.phase = 'train'
 opt.data = '/media/xyz/Files/data/datasets'
 opt.out = '/media/xyz/Files/data/models/torch/RFCN_pretrain'
-# opt.param = '/media/xyz/Files/data/models/torch/fcn/checkpoint/FCN-epoch-20-step-11354.pth'
+opt.param = '/media/xyz/Files/data/models/torch/RFCN_pretrain/RFCN-epoch-4-step-11354.pth'
 
 print(opt)
 
@@ -65,9 +67,7 @@ if opt.param is None:
     vgg16 = torchvision.models.vgg16(pretrained=True)
     model.copy_params_from_vgg16(vgg16, copy_fc8=False, init_upscore=True)
 else:
-    fcn = FCN8s()
-    fcn.load_state_dict(torch.load(opt.param))
-    model.copy_params_from_fcn(fcn)
+    model.load_state_dict(torch.load(opt.param))
 
 criterion = CrossEntropyLoss2d()
 optimizer = torch.optim.Adam(model.parameters(), 0.0001, betas=(0.5, 0.999))
@@ -86,44 +86,69 @@ if opt.phase == 'train':
             pmap = 1.0 - pmap
             pmap = torch.unsqueeze(torch.FloatTensor(pmap), 0)
             pmap = torch.unsqueeze(pmap, 0)
-            data[0] = torch.cat((data[0], pmap), 1)
-            inputs = Variable(data[0]).cuda()
+            pmap = Variable(pmap).cuda()
+            img = Variable(data[0]).cuda()
+
             # segmentation gt and bg&fg gt
             targets_S = Variable(data[1]).cuda()
             targets_G = torch.LongTensor(1, targets_S.size()[-2], targets_S.size()[-1]).fill_(0)
             targets_G[0][data[1] == 0] == 1
             targets_G = Variable(targets_G).cuda()
+
             model.zero_grad()
-            outputs = model(inputs)
-            loss_S = criterion(outputs[:, :21, :, :], targets_S)
-            loss_G = criterion(outputs[:, -2:, :, :], targets_G)
-            loss = loss_G + loss_S
-            epoch_loss.append(loss.data[0])
-            loss.backward()
-            optimizer.step()
-            if ib % 2 == 0:
-                image = inputs[0, :3].data.cpu()
+            loss = 0
+            for ir in range(3):
+                outputs = model(torch.cat((img, pmap.detach()), 1))  # detach or not?
+                loss_S = criterion(outputs[:, :21, :, :], targets_S)
+                loss_G = criterion(outputs[:, -2:, :, :], targets_G)
+                _loss = loss_G + loss_S
+                _loss.backward()
+                loss += _loss.data[0]
+
+                # update prior map
+                del pmap
+                gc.collect()
+                pmap = functional.sigmoid(outputs[:, -1, :, :])
+                pmap = torch.unsqueeze(pmap, 0)
+
+                # visulize
+                image = img[0].data.cpu()
                 image[0] = image[0] + 122.67891434
                 image[1] = image[1] + 116.66876762
                 image[2] = image[2] + 104.00698793
-                title = 'input (epoch: %d, step: %d)' % (it, ib)
+                title = 'input (epoch: %d, step: %d, recurrent: %d)' % (it, ib, ir)
                 vis.image(image, win=win1, env='fcn', opts=dict(title=title))
-                title = 'output_c (epoch: %d, step: %d)' % (it, ib)
+                title = 'output_c (epoch: %d, step: %d, recurrent: %d)' % (it, ib, ir)
                 vis.image(color_transform(outputs[0, :21].cpu().max(0)[1].data),
                           win=win2, env='fcn', opts=dict(title=title))
-                title = 'output_l (epoch: %d, step: %d)' % (it, ib)
-                vis.image(color_transform(outputs[0, -1:].cpu().data),
+                title = 'output_l (epoch: %d, step: %d, recurrent: %d)' % (it, ib, ir)
+                bb = functional.sigmoid(outputs[0, -1:].cpu().data)
+                vis.image(bb.repeat(3, 1, 1),
                           win=win22, env='fcn', opts=dict(title=title))
-                title = 'target (epoch: %d, step: %d)' % (it, ib)
+                title = 'target (epoch: %d, step: %d, recurrent: %d)' % (it, ib, ir)
                 vis.image(color_transform(targets_S.cpu().data),
                           win=win3, env='fcn', opts=dict(title=title))
-                average = sum(epoch_loss) / len(epoch_loss)
-                print('loss: %.4f (epoch: %d, step: %d)' % (loss.data[0], it, ib))
-                epoch_loss.append(average)
-                x = np.arange(1, len(epoch_loss) + 1, 1)
-                title = 'loss (epoch: %d, step: %d)' % (it, ib)
-                vis.line(np.array(epoch_loss), x, env='fcn', win=win0,
-                         opts=dict(title=title))
+
+                del outputs
+                gc.collect()
+
+            # update the net
+            optimizer.step()
+
+            # show loss plot in this batch
+            epoch_loss.append(loss)
+            average = sum(epoch_loss) / len(epoch_loss)
+            print('loss: %.4f (epoch: %d, step: %d)' % (loss, it, ib))
+            epoch_loss.append(average)
+            x = np.arange(1, len(epoch_loss) + 1, 1)
+            title = 'loss'
+            vis.line(np.array(epoch_loss), x, env='fcn', win=win0,
+                     opts=dict(title=title))
+
+            del img, targets_S, targets_G
+            gc.collect()
+
+        # save parameters in each iteration
         filename = ('%s/RFCN-epoch-%d-step-%d.pth' \
                     % (checkRoot, it, ib))
         torch.save(model.state_dict(), filename)
